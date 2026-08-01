@@ -351,8 +351,67 @@ def scan_errors_log(minutes: int = 30, tail_lines: int = 20000) -> dict:
 # ─────────────────────────────────────────────────────────────
 # L3: 会话恢复
 # ─────────────────────────────────────────────────────────────
+LOCK_FILE = HERMES_HOME / "tmp/auto_heal.lock"
+
+
+def acquire_lock(timeout: int = 5) -> bool:
+    """单实例锁: 防止多个 cron 并发执行自愈 (v2.1 防递归关键)。"""
+    try:
+        LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if LOCK_FILE.exists():
+            age = time.time() - LOCK_FILE.stat().st_mtime
+            if age > 1800:  # 锁超过30分钟视为死锁, 强制覆盖
+                LOCK_FILE.unlink()
+            else:
+                return False
+        LOCK_FILE.write_text(str(time.time()))
+        return True
+    except Exception:
+        return False
+
+
+def release_lock() -> None:
+    try:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+    except Exception:
+        pass
+
+
+def is_active_session(session_id: str, idle_threshold: int = 120) -> bool:
+    """
+    v2.1 关键保护: 判断会话是否"活跃" (正在被用户/桌面端交互)。
+    活跃会话绝不自动恢复 — 避免递归自愈 (恢复指令注入正在运行的会话 → 新调用 → 又失败 → 又注入)。
+    判据: end_reason IS NULL 且最近 idle_threshold 秒内有新消息 = 正在使用。
+    """
+    try:
+        conn = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True)
+        row = conn.execute(
+            "SELECT end_reason FROM sessions WHERE id=?", (session_id,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return False
+        if row[0] is not None:
+            conn.close()
+            return False  # 已结束的会话, 可以恢复
+        # 会话未结束 → 看最近是否有新消息
+        r = conn.execute(
+            "SELECT MAX(timestamp) FROM messages WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        conn.close()
+        last_ts = r[0] if r and r[0] else 0
+        return (time.time() - last_ts) < idle_threshold
+    except Exception:
+        return True  # 无法判断 → 保守: 视为活跃, 不恢复
+
+
 def resume_session(session_id: str, provider: str, model: str, task_hint: str = "") -> tuple[bool, str]:
     """用指定模型自动恢复中断会话, 让它把未完成的工作继续做完。"""
+    # v2.1: 活跃会话保护 — 正在交互的会话绝不自动恢复
+    if is_active_session(session_id):
+        return False, "会话活跃中(有用户交互), 跳过自动恢复"
     prompt = (f"【自动恢复】你刚才的任务因 API 中断而停止。请检查会话历史, "
               f"继续完成未完成的工作, 直到任务真正完成。")
     if task_hint:
@@ -413,8 +472,16 @@ def main():
     elif args.status:
         mode = "status"
 
-    output = []
+    # v2.1: 单实例锁 — 防并发递归 (多个 cron 同时触发)
+    if mode in ("fast", "heal") and not acquire_lock():
+        return 0  # 另一个实例在跑, 静默退出
+    try:
+        return _run(mode, [])
+    finally:
+        release_lock()
 
+
+def _run(mode: str, output: list) -> int:
     if mode == "fast":
         # ── 快速模式: 不跑完整健康检查, 直接扫日志 (秒级) ──
         log_scan = scan_errors_log(minutes=10)
@@ -434,11 +501,11 @@ def main():
                 save_config(cfg)
                 output.append(f"💀 日志显示死模型, 已从 fallback 链移除: {', '.join(removed)}")
 
-        # 主模型若在死列表 → 切换
+        # 主模型若在死列表 → 切换 (用最近的健康检查数据, 不重跑完整检查)
         model_cfg = cfg.get("model", {})
         cur_prov = str(model_cfg.get("provider", "")).replace("custom:", "")
         if cur_prov in log_scan["dead_providers"]:
-            # 快速健康检查找替补 (限时 60s)
+            # 快速健康检查找替补 (限时 90s)
             health = run_health_check(timeout=90)
             prov, model = pick_best_model(health)
             if prov:
@@ -447,16 +514,8 @@ def main():
                 save_config(cfg)
                 output.append(f"🔁 主模型 {cur_prov} 已死(日志确认), 切换为 {prov}/{model}")
 
-        # 受影响会话 → 自动恢复
-        if log_scan["interrupted_sessions"]:
-            health = run_health_check(timeout=90)
-            prov, model = pick_best_model(health)
-            if prov:
-                for sess in log_scan["interrupted_sessions"]:
-                    ok, msg = resume_session(sess["session_id"], prov, model, sess["reason"])
-                    output.append(f"🛠️ 自动恢复会话 {sess['session_id']} ({sess['title']}) "
-                                  f"用 {prov}/{model}: {'✅ ' + msg if ok else '❌ ' + msg}")
-
+        # v2.1: fast 模式不自动恢复会话 (只摘死模型+切主模型)
+        # 恢复动作留给 heal 深度模式, 且 heal 有活跃会话保护
         if output:
             for line in output:
                 log(line)
@@ -503,6 +562,7 @@ def main():
             prov, model = pick_best_model(health)
             if prov:
                 for sess in interrupted:
+                    # v2.1: 活跃会话保护在 resume_session 内部
                     ok, msg = resume_session(sess["session_id"], prov, model, sess["reason"])
                     output.append(f"🛠️ 自动恢复会话 {sess['session_id']} ({sess['title']}) "
                                   f"用 {prov}/{model}: {'✅ ' + msg if ok else '❌ ' + msg}")
