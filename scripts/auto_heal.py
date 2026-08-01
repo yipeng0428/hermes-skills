@@ -1,20 +1,34 @@
 #!/usr/bin/env python3
 """
-Hermes Auto-Heal — 中断自愈系统 v1.0
+Hermes Auto-Heal — 中断自愈系统 v2.0
 =====================================
 免费 API 报错 → 自动切换其它可用模型 → 自动恢复未完成工作，全程无需人工确认。
+
+v2.0 关键升级 (2026-08-01):
+  ✅ L3b 实时错误日志检测 — 扫描 logs/errors.log 中的 API 失败
+     (403/401/405/quota exhausted/Non-retryable/Streaming failed)
+     修复 v1 盲区: v1 只看 state.db finish_reason='error'，
+     但真实中断时会话 finish_reason 仍是 tool_calls (turn 内失败) → 漏检!
+  ✅ 死模型自动摘除 — errors.log 中出现 quota exhausted / 403 等
+     → 立即从 fallback 链摘除, 不等健康巡检
+  ✅ --fast 快速模式 — 只扫日志+摘死模型+恢复受影响会话 (秒级, 适合高频轮询)
 
 三层防线:
   L1 静态防线:  健康 fallback 链 (config.yaml fallback_model, 由本脚本维护)
   L2 动态防线:  定时健康巡检, 自动把死模型摘出 fallback 链 / 恢复的加回
   L3 中断自愈:  检测中断会话 → 自动切换主模型 → 自动 resume 未完成任务
+                 L3a: state.db 判据 (finish_reason=error / end_reason 异常)
+                 L3b: errors.log 实时判据 (API 调用失败日志, v2.0 新增)
 
 运行模式:
   python auto_heal.py --check     # 仅巡检 fallback 链健康度并修复 (L1+L2)
-  python auto_heal.py --heal      # 巡检 + 中断检测 + 自动恢复 (L1+L2+L3)
+  python auto_heal.py --heal      # 巡检 + 中断检测 + 自动恢复 (L1+L2+L3, 默认)
+  python auto_heal.py --fast      # 快速模式: 只扫 errors.log + 摘死模型 + 恢复 (秒级)
   python auto_heal.py --status    # 查看当前健康状态 (只读)
 
-Cron 建议: no_agent=true, 每 5-10 分钟跑一次 --heal。
+Cron 建议: no_agent=true
+  每 2 分钟: auto_heal.py --fast   (实时响应)
+  每 10 分钟: auto_heal.py --heal  (全量巡检)
 空输出 = 一切正常 (静默); 有输出 = 发生了自愈动作或异常, 通知用户。
 """
 import argparse
@@ -31,17 +45,34 @@ from pathlib import Path
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", "E:/hermes"))
 CONFIG_PATH = HERMES_HOME / "config.yaml"
 STATE_DB = HERMES_HOME / "state.db"
+ERRORS_LOG = HERMES_HOME / "logs/errors.log"
 HEALTH_SCRIPT = Path.home() / ".hermes/scripts/quick_health_check.py"
 HERMES_EXE = str(HERMES_HOME / "hermes-agent/venv/Scripts/hermes.exe")
 
 # 判断"死模型"的错误关键词(免费 API 常见花式报错)
 DEAD_KEYWORDS = [
-    "401", "403", "405", "429", "insufficient", "quota", "balance",
+    "401", "403", "405", "insufficient", "quota", "balance",
     "unauthorized", "invalid api key", "expired", "not found", "404",
-    "model not", "不存在", "无权", "余额", "已过期",
+    "model not", "不存在", "无权", "余额", "已过期", "quota exhausted",
+    "free tier", "allocationquota", "permissiondenied",
 ]
 # 明确的"临时故障"关键词(不该摘除, 重试即可)
 TRANSIENT_KEYWORDS = ["timeout", "timed out", "502", "503", "529", "connection", "overloaded", "繁忙", "访问量过大"]
+
+# errors.log 中代表"API 调用失败"的行特征
+LOG_FAIL_PATTERNS = [
+    r"API call failed",
+    r"Non-retryable client error",
+    r"Streaming failed before delivery",
+    r"all retries exhausted",
+    r"Connection error",
+    r"APIConnectionError",
+    r"RateLimitError",
+    r"AuthenticationError",
+    r"PermissionDeniedError",
+    r"BadRequestError",
+    r"NotFoundError",
+]
 
 
 def log(msg: str) -> None:
@@ -121,122 +152,85 @@ def save_config(cfg: dict) -> None:
     )
 
 
-def provider_available(provider: str, health: list) -> bool:
-    """健康结果里该 provider 是否可用。provider 可能是 custom:qwen1 形式。"""
-    for h in health:
-        hp = str(h.get("provider", ""))
-        if hp == provider or hp == provider.replace("custom:", ""):
-            if classify_status(h) == "ok":
-                return True
-    return False
-
-
-def get_health_for(provider: str, health: list) -> dict | None:
-    for h in health:
-        hp = str(h.get("provider", ""))
-        if hp == provider or hp == provider.replace("custom:", ""):
-            return h
-    return None
-
-
-def fix_fallback_chain(health: list, cfg: dict) -> tuple[list, list]:
-    """重排 fallback_model: 死模型摘除, 恢复的加回, 按延迟排序。返回 (新链, 变更说明)。"""
+def fix_fallback_chain(health: list, cfg: dict) -> tuple:
+    """根据健康数据重排 fallback 链: 移除 dead, 按延迟排序。返回 (新链, 变更描述)。"""
     chain = cfg.get("fallback_model", [])
-    if not isinstance(chain, list):
-        chain = []
+    if not chain:
+        return chain, []
     changes = []
 
-    # 1. 摘除死模型
-    alive = []
-    for entry in chain:
-        provider = str(entry.get("provider", "")).strip()
-        h = get_health_for(provider, health)
-        if h is None:
-            alive.append(entry)  # 没测到, 保持
-            continue
-        cls = classify_status(h)
-        if cls == "dead":
-            changes.append(f"摘除死模型: {provider}/{entry.get('model','')} ({h.get('error','')[:60]})")
-            continue
-        alive.append(entry)
+    # 建 provider → (latency, status) 映射
+    info = {}
+    for h in health:
+        prov = str(h.get("provider", ""))
+        info[prov] = (h.get("latency", 999), classify_status(h))
 
-    # 2. 把健康但不在链里的 provider 加回(按延迟排序追加)
-    in_chain = {str(e.get("provider", "")).replace("custom:", "") for e in alive}
-    healthy_extra = []
+    dead_in_chain = []
+    for entry in chain:
+        prov = entry.get("provider", "")
+        # 去掉 custom: 前缀做匹配
+        key = prov.replace("custom:", "")
+        status = info.get(key, ("?", "unknown"))[1]
+        if status == "dead":
+            dead_in_chain.append(prov)
+    if dead_in_chain:
+        new_chain = [e for e in chain if e.get("provider", "") not in dead_in_chain]
+        cfg["fallback_model"] = new_chain
+        save_config(cfg)
+        changes.append(f"💀 已从 fallback 链移除死模型: {', '.join(dead_in_chain)}")
+
+    # 活着且有序: 按延迟重排
+    alive = [e for e in cfg["fallback_model"]]
+    keyed = []
+    for e in alive:
+        prov = e.get("provider", "").replace("custom:", "")
+        lat = info.get(prov, (999, "unknown"))[0]
+        keyed.append((lat, e))
+    keyed.sort(key=lambda x: x[0])
+    sorted_chain = [e for _, e in keyed]
+    if sorted_chain != cfg["fallback_model"]:
+        cfg["fallback_model"] = sorted_chain
+        save_config(cfg)
+        changes.append("🔀 fallback 链已按延迟重排: " + " → ".join(e.get("provider", "?") for e in sorted_chain))
+    return cfg["fallback_model"], changes
+
+
+def ensure_primary_healthy(cfg: dict, health: list) -> tuple:
+    """如果主模型挂了, 自动切到当前最优健康模型。返回 (动作, 变更描述)。"""
+    model_cfg = cfg.get("model", {})
+    cur_prov = str(model_cfg.get("provider", ""))
+    cur_model = str(model_cfg.get("default", ""))
+    info = {}
+    for h in health:
+        prov = str(h.get("provider", ""))
+        info[prov] = (h.get("latency", 999), classify_status(h))
+    key = cur_prov.replace("custom:", "")
+    cur_status = info.get(key, (999, "unknown"))[1]
+    if cur_status != "dead":
+        return "none", []
+    # 主模型死了 → 找最优
+    best = None
     for h in health:
         if classify_status(h) != "ok":
             continue
-        hp = str(h.get("provider", ""))
-        if hp in in_chain or hp == "ollama":
+        if str(h.get("provider", "")) == "ollama":
             continue
-        # 找该 provider 的默认模型
-        entry = {"provider": f"custom:{hp}" if hp in ("qwen1", "qwen2") else hp,
-                 "model": str(h.get("model", ""))}
-        if entry["model"]:
-            healthy_extra.append((h.get("latency", 999), entry))
-    healthy_extra.sort(key=lambda x: x[0])
-    for _, entry in healthy_extra:
-        alive.append(entry)
-        changes.append(f"加回健康模型: {entry['provider']}/{entry['model']}")
-
-    # 3. 排序: 保持原链顺序(用户偏好), 新加的在末尾
-    new_chain = alive
-    if new_chain != chain:
-        cfg["fallback_model"] = new_chain
-        save_config(cfg)
-        changes.append("fallback 链已更新")
-
-    return new_chain, changes
-
-
-def ensure_primary_healthy(cfg: dict, health: list) -> tuple[str, list]:
-    """主模型挂了 → 自动切换到当前最健康、延迟最低的可用模型。返回 (动作, 说明)。"""
-    changes = []
-    provider = str(cfg.get("model", {}).get("provider", ""))
-    model = str(cfg.get("model", {}).get("default", ""))
-    h = get_health_for(provider, health)
-    if h is not None and classify_status(h) == "ok":
-        return "keep", changes
-    if h is None:
-        return "keep", changes  # 没测到, 不动
-
-    # 主模型不可用 → 找最优替代
-    best = None
-    for cand in health:
-        if classify_status(cand) != "ok":
-            continue
-        hp = str(cand.get("provider", ""))
-        if hp == "ollama":
-            continue
-        lat = cand.get("latency", 999)
+        lat = h.get("latency", 999)
         if best is None or lat < best[0]:
-            best = (lat, hp, str(cand.get("model", "")))
-    if best is None:
-        changes.append(f"⚠️ 主模型 {provider}/{model} 不可用且无健康替代, 需要人工介入")
-        return "none", changes
-
-    lat, new_provider, new_model = best
-    new_provider_cfg = f"custom:{new_provider}" if new_provider in ("qwen1", "qwen2") else new_provider
-    cfg.setdefault("model", {})["provider"] = new_provider_cfg
-    cfg["model"]["default"] = new_model
+            best = (lat, str(h.get("provider", "")), str(h.get("model", "")))
+    if not best:
+        return "none", [f"⚠️ 主模型 {cur_prov}/{cur_model} 已死, 但无可用替补!"]
+    _, prov, model = best
+    model_cfg["provider"] = prov
+    model_cfg["default"] = model
     save_config(cfg)
-    changes.append(f"🔁 主模型自动切换: {provider}/{model} → {new_provider_cfg}/{new_model} (延迟{lat}s)")
-    return "switched", changes
+    return "switched", [f"🔁 主模型 {cur_prov}/{cur_model} 已死, 自动切换为 {prov}/{model}"]
 
 
 # ─────────────────────────────────────────────────────────────
-# L3: 中断检测 + 自动恢复
+# L3a: state.db 中断会话检测 (v1 逻辑)
 # ─────────────────────────────────────────────────────────────
 def detect_interrupted_sessions(minutes: int = 30) -> list:
-    """扫描 state.db, 找最近 minutes 分钟内"中断"的会话。
-
-    判据:
-      - 会话最近一条 assistant 消息 finish_reason='error'
-      - 或会话 end_reason 为异常值 (agent_close/ws_orphan_reap 且消息里带错误)
-      - 且会话未正常完成 (最后一条不是正常 stop 回复)
-    """
-    if not STATE_DB.exists():
-        return []
     try:
         conn = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True)
         since = time.time() - minutes * 60
@@ -274,6 +268,89 @@ def detect_interrupted_sessions(minutes: int = 30) -> list:
     return interrupted
 
 
+# ─────────────────────────────────────────────────────────────
+# L3b: errors.log 实时错误检测 (v2.0 新增 — 修复 v1 盲区)
+# ─────────────────────────────────────────────────────────────
+def scan_errors_log(minutes: int = 30, tail_lines: int = 20000) -> dict:
+    """
+    扫描 errors.log 最近 minutes 分钟内的 API 失败。
+    返回: {
+      "dead_providers": [provider...],     # 出现 quota/403/401 等永久死信号
+      "interrupted_sessions": [{session_id, title, reason}...],  # 日志中受影响的会话
+      "fail_count": int
+    }
+    """
+    result = {"dead_providers": [], "interrupted_sessions": [], "fail_count": 0}
+    if not ERRORS_LOG.exists():
+        return result
+
+    try:
+        lines = ERRORS_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception as e:
+        log(f"⚠️ errors.log 读取失败: {e}")
+        return result
+
+    cutoff = time.time() - minutes * 60
+    seen_sessions = set()
+    dead_seen = set()
+    session_title_cache = {}
+
+    # 倒序扫描(最新优先), 只处理时间窗口内的行
+    for line in reversed(lines[-tail_lines:]):
+        m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+        if not m:
+            continue
+        try:
+            ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+            if ts.timestamp() < cutoff:
+                break  # 倒序遇到窗口外 → 结束
+        except ValueError:
+            continue
+
+        # 是否 API 失败行?
+        is_fail = any(p.lower() in line.lower() for p in LOG_FAIL_PATTERNS)
+        if not is_fail:
+            continue
+
+        result["fail_count"] += 1
+
+        # 提取 provider (provider=custom:qwen1 或 provider=longcat)
+        pm = re.search(r"provider=([\w:-]+)", line)
+        if pm:
+            prov = pm.group(1).replace("custom:", "")
+            if any(k.lower() in line.lower() for k in DEAD_KEYWORDS):
+                if prov not in dead_seen:
+                    dead_seen.add(prov)
+                    result["dead_providers"].append(prov)
+
+        # 提取会话 id ([20260801_143554_491755] 或 session_id=...)
+        sm = re.search(r"\[(\d{8}_\d{6}_[a-z0-9]+)\]", line)
+        if not sm:
+            sm = re.search(r"session_id=([\w]+)", line)
+        if sm:
+            sid = sm.group(1)
+            if sid not in seen_sessions:
+                seen_sessions.add(sid)
+                # 从 state.db 拿标题
+                title = session_title_cache.get(sid, "(日志会话)")
+                try:
+                    conn = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True)
+                    r = conn.execute("SELECT title FROM sessions WHERE id=?", (sid,)).fetchone()
+                    conn.close()
+                    if r and r[0]:
+                        title = r[0]
+                except Exception:
+                    pass
+                result["interrupted_sessions"].append({
+                    "session_id": sid, "title": title,
+                    "reason": f"errors.log API 失败 (最近{minutes}分钟)"
+                })
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+# L3: 会话恢复
+# ─────────────────────────────────────────────────────────────
 def resume_session(session_id: str, provider: str, model: str, task_hint: str = "") -> tuple[bool, str]:
     """用指定模型自动恢复中断会话, 让它把未完成的工作继续做完。"""
     prompt = (f"【自动恢复】你刚才的任务因 API 中断而停止。请检查会话历史, "
@@ -298,20 +375,94 @@ def resume_session(session_id: str, provider: str, model: str, task_hint: str = 
         return False, str(e)
 
 
+def pick_best_model(health: list) -> tuple:
+    """从健康池中选最优恢复模型 (跳过 ollama 本地)。返回 (provider, model)。"""
+    best = None
+    for h in health:
+        if classify_status(h) != "ok":
+            continue
+        if str(h.get("provider", "")) == "ollama":
+            continue
+        lat = h.get("latency", 999)
+        if best is None or lat < best[0]:
+            best = (lat, str(h.get("provider", "")), str(h.get("model", "")))
+    if not best:
+        return None, None
+    _, prov, model = best
+    provider_cfg = f"custom:{prov}" if prov in ("qwen1", "qwen2") else prov
+    return provider_cfg, model
+
+
 # ─────────────────────────────────────────────────────────────
 # 主流程
 # ─────────────────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="Hermes Auto-Heal 中断自愈系统")
+    ap = argparse.ArgumentParser(description="Hermes Auto-Heal 中断自愈系统 v2.0")
     ap.add_argument("--check", action="store_true", help="仅巡检 fallback 链 (L1+L2)")
     ap.add_argument("--heal", action="store_true", help="巡检 + 中断自愈 (L1+L2+L3, 默认模式)")
+    ap.add_argument("--fast", action="store_true", help="快速模式: 扫 errors.log + 摘死模型 + 恢复 (秒级)")
     ap.add_argument("--status", action="store_true", help="只读状态")
     args = ap.parse_args()
 
-    # 无参数 → 默认 heal (cron 直接调用)
-    mode = "heal" if (args.heal or not (args.check or args.status)) else ("check" if args.check else "status")
+    # 无参数 → 默认 heal
+    mode = "heal"
+    if args.fast:
+        mode = "fast"
+    elif args.check:
+        mode = "check"
+    elif args.status:
+        mode = "status"
 
-    # 1. 健康巡检
+    output = []
+
+    if mode == "fast":
+        # ── 快速模式: 不跑完整健康检查, 直接扫日志 (秒级) ──
+        log_scan = scan_errors_log(minutes=10)
+        if log_scan["fail_count"] == 0:
+            return 0  # 完全静默
+        output.append(f"⚠️ 最近10分钟 errors.log 检测到 {log_scan['fail_count']} 次 API 失败")
+
+        # 死模型 → 从 fallback 链摘除
+        cfg = load_config()
+        if log_scan["dead_providers"]:
+            chain = cfg.get("fallback_model", [])
+            dead = log_scan["dead_providers"]
+            removed = [e.get("provider", "") for e in chain
+                       if e.get("provider", "").replace("custom:", "") in dead]
+            if removed:
+                cfg["fallback_model"] = [e for e in chain if e.get("provider", "") not in removed]
+                save_config(cfg)
+                output.append(f"💀 日志显示死模型, 已从 fallback 链移除: {', '.join(removed)}")
+
+        # 主模型若在死列表 → 切换
+        model_cfg = cfg.get("model", {})
+        cur_prov = str(model_cfg.get("provider", "")).replace("custom:", "")
+        if cur_prov in log_scan["dead_providers"]:
+            # 快速健康检查找替补 (限时 60s)
+            health = run_health_check(timeout=90)
+            prov, model = pick_best_model(health)
+            if prov:
+                model_cfg["provider"] = prov
+                model_cfg["default"] = model
+                save_config(cfg)
+                output.append(f"🔁 主模型 {cur_prov} 已死(日志确认), 切换为 {prov}/{model}")
+
+        # 受影响会话 → 自动恢复
+        if log_scan["interrupted_sessions"]:
+            health = run_health_check(timeout=90)
+            prov, model = pick_best_model(health)
+            if prov:
+                for sess in log_scan["interrupted_sessions"]:
+                    ok, msg = resume_session(sess["session_id"], prov, model, sess["reason"])
+                    output.append(f"🛠️ 自动恢复会话 {sess['session_id']} ({sess['title']}) "
+                                  f"用 {prov}/{model}: {'✅ ' + msg if ok else '❌ ' + msg}")
+
+        if output:
+            for line in output:
+                log(line)
+        return 0
+
+    # ── 完整模式 (check / heal / status): 先跑健康巡检 ──
     health = run_health_check()
     if not health:
         log("⚠️ 无法获取健康数据, 本次跳过")
@@ -325,9 +476,7 @@ def main():
                   f"延迟{h.get('latency', '?')}s {h.get('error', '')[:80]}")
         return 0
 
-    output = []
-
-    # 2. L1+L2: fallback 链修复
+    # 1. L1+L2: fallback 链修复
     cfg = load_config()
     new_chain, chain_changes = fix_fallback_chain(health, cfg)
     output.extend(chain_changes)
@@ -336,29 +485,29 @@ def main():
     action, primary_changes = ensure_primary_healthy(cfg, health)
     output.extend(primary_changes)
 
-    # 3. L3: 中断检测 + 自动恢复 (仅 --heal)
+    # 2. L3: 中断检测 + 自动恢复
     if mode == "heal":
+        # L3a: state.db 判据
         interrupted = detect_interrupted_sessions(minutes=30)
-        if interrupted:
-            # 找当前最优健康模型用于恢复
-            best = None
-            for h in health:
-                if classify_status(h) != "ok":
-                    continue
-                if str(h.get("provider", "")) == "ollama":
-                    continue
-                lat = h.get("latency", 999)
-                if best is None or lat < best[0]:
-                    best = (lat, str(h.get("provider", "")), str(h.get("model", "")))
-            if best:
-                _, prov, model = best
-                provider_cfg = f"custom:{prov}" if prov in ("qwen1", "qwen2") else prov
-                for sess in interrupted:
-                    ok, msg = resume_session(sess["session_id"], provider_cfg, model, sess["reason"])
-                    output.append(f"🛠️ 自动恢复会话 {sess['session_id']} ({sess['title']}) "
-                                  f"用 {provider_cfg}/{model}: {'✅ ' + msg if ok else '❌ ' + msg}")
+        # L3b: errors.log 判据 (v2.0)
+        log_scan = scan_errors_log(minutes=10)
+        if log_scan["fail_count"] > 0:
+            output.append(f"⚠️ 最近10分钟 errors.log 有 {log_scan['fail_count']} 次 API 失败")
+        # 合并: 日志中出现的会话也视为中断 (去重)
+        log_sessions = {s["session_id"] for s in log_scan["interrupted_sessions"]}
+        for s in log_scan["interrupted_sessions"]:
+            if s["session_id"] not in {x["session_id"] for x in interrupted}:
+                interrupted.append(s)
 
-    # 4. 输出(空 = 静默, 有 = 通知)
+        if interrupted:
+            prov, model = pick_best_model(health)
+            if prov:
+                for sess in interrupted:
+                    ok, msg = resume_session(sess["session_id"], prov, model, sess["reason"])
+                    output.append(f"🛠️ 自动恢复会话 {sess['session_id']} ({sess['title']}) "
+                                  f"用 {prov}/{model}: {'✅ ' + msg if ok else '❌ ' + msg}")
+
+    # 3. 输出(空 = 静默, 有 = 通知)
     if output:
         for line in output:
             log(line)
