@@ -50,9 +50,12 @@ L3 中断自愈  检测中断会话 → 自动切换主模型 → hermes chat --
    且最近有消息，不能恢复
 
 **部署架构 (v2.1 最终)**:
-- `🔴 auto-heal 快速巡检` 每 2 分钟 `--fast`（摘死模型，秒级）
-- `🩺 AI 中断自愈巡检` 每 10 分钟 `--heal`（全量恢复）
+- `🔴 auto-heal 快速巡检` 每 2 分钟 `auto_heal_fast.py`（摘死模型，秒级）
+- `🩺 AI 中断自愈巡检` 每 10 分钟 `auto_heal_deep.py`（全量恢复）
 - 两者都有锁保护，不会并发冲突
+- ⚠️ **cron no_agent 模式不支持参数**: script 字段必须是纯文件名，
+  带参数会报 "Script not found: xxx.py --fast"。用薄 wrapper 脚本
+  （auto_heal_fast.py / auto_heal_deep.py）转发参数即可
 
 ## 运行模式
 
